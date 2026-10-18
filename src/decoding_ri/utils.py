@@ -1,0 +1,183 @@
+"""Parse Blackrock .nev digital event codes into pynapple objects.
+
+Typical use:
+    from nev_events import load_task_events
+    ev = load_task_events("day2.nev")
+    print(ev.summary())
+    spikes.restrict(ev.baseline)
+    nap.compute_perievent(spikes, ev.images, minmax=(-0.2, 0.6))
+
+Structure:
+    read_event_codes   -- file I/O only (neo); returns the raw port values
+    clean_codes        -- drops clears (0) and half-written glitch values
+    parse_task_events  -- pure function: cleaned codes -> TaskEvents
+    load_task_events   -- convenience wrapper chaining the three
+
+Only read_event_codes touches the file, so the other two can be unit tested
+on synthetic nap.Tsd streams.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import pynapple as nap
+
+# ── Encode table (from the task code) ───────────────────────────────
+START_TASK = 1      # sent nStartTaskRepeats times (default 3)
+REWARD_START = 2
+REWARD_END = 3
+END_TASK = 4
+INITIAL_START = 5
+BLOCK_START = 100   # + blockNum
+BLOCK_END = 500     # + blockNum
+SEQ_START = 1000    # + seqId
+SEQ_END = 3000      # + seqId
+IMAGE_ON = 6000     # + imgNum
+MAX_CODE = 2**16 - 1
+
+# A real code stays on the port until it is cleared one frame later (~8 ms);
+# half-written values (port bits changing non-simultaneously) last ~0.1 ms.
+DEFAULT_MIN_HOLD = 0.001  # seconds
+
+
+@dataclass
+class TaskEvents:
+    """Experiment phases as IntervalSets, plus image onsets.
+
+    blocks    -- metadata: block
+    sequences -- metadata: block, seq
+    reward    -- metadata: block
+    images    -- Tsd of onset times (code sent just before the flip),
+                 values = imgNum
+    """
+
+    baseline: nap.IntervalSet
+    task: nap.IntervalSet
+    blocks: nap.IntervalSet
+    sequences: nap.IntervalSet
+    reward: nap.IntervalSet
+    images: nap.Tsd
+
+    def summary(self) -> str:
+        lines = []
+        for name in ("baseline", "task", "blocks", "sequences", "reward"):
+            iset = getattr(self, name)
+            lines.append(f"{name:10s} n={len(iset):4d}  total={iset.tot_length():8.1f} s")
+        lines.append(f"{'images':10s} n={len(self.images):4d}")
+        return "\n".join(lines)
+
+
+# ── I/O ─────────────────────────────────────────────────────────────
+def read_event_codes(path: str | Path, event_channel_index: int = 0) -> nap.Tsd:
+    """Raw digital-port values from a .nev file (includes clears and glitches)."""
+    from neo.rawio import BlackrockRawIO  # imported here so tests don't need neo
+
+    r = BlackrockRawIO(str(path))
+    r.parse_header()
+    ts, _, labels = r.get_event_timestamps(
+        block_index=0, seg_index=0, event_channel_index=event_channel_index
+    )
+    t = r.rescale_event_timestamp(ts, dtype="float64", event_channel_index=event_channel_index)
+    return nap.Tsd(t=t, d=np.asarray(labels).astype(int))
+
+
+# ── Cleaning ────────────────────────────────────────────────────────
+def clean_codes(codes: nap.Tsd, min_hold: float = DEFAULT_MIN_HOLD) -> nap.Tsd:
+    """Keep only values that stayed on the port for at least `min_hold` seconds.
+
+    Removes the clears (0) and the transient half-written values that appear
+    when the 16-bit code changes in two steps (~0.1 ms before a code, or
+    while it is being cleared).
+    """
+    if len(codes) == 0:
+        return codes
+    held = np.r_[np.diff(codes.t), np.inf]
+    return codes[(codes.d != 0) & (held > min_hold)]
+
+
+# ── Parsing ─────────────────────────────────────────────────────────
+def _select(codes: nap.Tsd, lo: int, hi: int | None = None) -> nap.Tsd:
+    hi = lo if hi is None else hi
+    return codes[(codes.d >= lo) & (codes.d <= hi)]
+
+
+def _first_each(ev: nap.Tsd) -> nap.Tsd:
+    """First occurrence of each distinct code, in time order."""
+    _, idx = np.unique(ev.d, return_index=True)
+    return ev[np.sort(idx)]
+
+
+def _check_pairs(starts: nap.Tsd, ends: nap.Tsd, start_base: int, end_base: int, name: str):
+    s_id, e_id = starts.d - start_base, ends.d - end_base
+    if len(s_id) != len(e_id) or not np.array_equal(s_id, e_id):
+        raise ValueError(
+            f"{name}: start/end codes don't pair up "
+            f"({len(s_id)} starts, {len(e_id)} ends)"
+        )
+    if np.any(starts.t >= ends.t):
+        raise ValueError(f"{name}: some intervals end before they start")
+
+
+def _block_of(times: np.ndarray, block_starts: nap.Tsd) -> np.ndarray:
+    """Block number containing each time (-1 if before the first block)."""
+    if len(block_starts) == 0:
+        return np.full(len(times), -1)
+    idx = np.searchsorted(block_starts.t, times, side="right") - 1
+    nums = block_starts.d[np.clip(idx, 0, None)] - BLOCK_START
+    return np.where(idx >= 0, nums, -1)
+
+
+def parse_task_events(codes: nap.Tsd, require_sequential_images: bool = True) -> TaskEvents:
+    """Build phase IntervalSets from cleaned event codes (see clean_codes)."""
+    init, start = _select(codes, INITIAL_START), _select(codes, START_TASK)
+    if len(init) == 0:
+        raise ValueError("no InitialStart code found")
+    if len(start) == 0:
+        raise ValueError("no StartTask code found")
+    t_init, t_start = init.t[0], start.t[0]
+
+    end = _select(codes, END_TASK)
+    t_end = end.t[0] if len(end) else codes.t[-1]  # EndTask may be missing
+
+    # Block markers can be re-sent (e.g. final block end at shutdown): keep first of each.
+    b_st = _first_each(_select(codes, BLOCK_START + 1, BLOCK_END - 1))
+    b_en = _first_each(_select(codes, BLOCK_END + 1, SEQ_START - 1))
+    _check_pairs(b_st, b_en, BLOCK_START, BLOCK_END, "blocks")
+
+    s_st = _select(codes, SEQ_START + 1, SEQ_END - 1)
+    s_en = _select(codes, SEQ_END + 1, IMAGE_ON - 1)
+    _check_pairs(s_st, s_en, SEQ_START, SEQ_END, "sequences")
+
+    r_st, r_en = _select(codes, REWARD_START), _select(codes, REWARD_END)
+    if len(r_st) != len(r_en):
+        raise ValueError(f"reward: {len(r_st)} starts, {len(r_en)} ends")
+
+    on = _select(codes, IMAGE_ON + 1, MAX_CODE)
+    if require_sequential_images and np.any(np.diff(on.d) != 1):
+        raise ValueError("image codes are not strictly sequential")
+
+    return TaskEvents(
+        baseline=nap.IntervalSet(t_init, t_start),
+        task=nap.IntervalSet(t_start, t_end),
+        blocks=nap.IntervalSet(b_st.t, b_en.t, metadata={"block": b_st.d - BLOCK_START}),
+        sequences=nap.IntervalSet(
+            s_st.t, s_en.t,
+            metadata={"block": _block_of(s_st.t, b_st), "seq": s_st.d - SEQ_START},
+        ),
+        reward=nap.IntervalSet(r_st.t, r_en.t, metadata={"block": _block_of(r_st.t, b_st)}),
+        images=nap.Tsd(t=on.t, d=on.d - IMAGE_ON),
+    )
+
+
+def load_task_events(
+    path: str | Path,
+    event_channel_index: int = 0,
+    min_hold: float = DEFAULT_MIN_HOLD,
+    require_sequential_images: bool = True,
+) -> TaskEvents:
+    """Read, clean and parse a .nev file in one call."""
+    codes = clean_codes(read_event_codes(path, event_channel_index), min_hold)
+    return parse_task_events(codes, require_sequential_images)
