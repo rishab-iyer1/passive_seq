@@ -2,7 +2,7 @@ import numpy as np
 import pynapple as nap
 import pytest
 
-from utils import clean_codes, parse_task_events
+from nev_events import clean_codes, label, make_epochs, parse_task_events, split_by
 
 FRAME = 0.0083  # code is cleared one frame after being set
 
@@ -77,3 +77,42 @@ def test_mismatched_block_raises():
     c = c[c.d != 501]
     with pytest.raises(ValueError, match="blocks"):
         parse_task_events(c)
+
+
+def test_epochs_dict_and_split_by():
+    ev = parse_task_events(clean_codes(session()))
+    d = ev.epochs()
+    assert set(d) == {"baseline", "task", "blocks", "sequences", "reward"}
+    assert all(isinstance(v, nap.IntervalSet) for v in d.values())
+
+    per_block = split_by(ev.blocks, "block", "block")
+    assert list(per_block) == ["block1", "block2"]
+    assert per_block["block2"].start[0] == pytest.approx(14.0)
+
+    spikes = nap.TsGroup({0: nap.Ts(t=np.linspace(0.5, 17.5, 200))})
+    resp = nap.compute_response_per_epoch(spikes, per_block)
+    assert list(resp.epochs.values) == ["block1", "block2"]
+
+
+RULES = {"odd": lambda x: x.block % 2 == 1}  # block 2 matches nothing
+
+
+def test_make_epochs():
+    ev = parse_task_events(clean_codes(session()))
+    ep = make_epochs(ev.sequences, RULES)
+    assert list(ep) == ["odd"]
+    assert list(ep["odd"].block) == [1]
+
+
+def test_label_and_split():
+    ev = parse_task_events(clean_codes(session()))
+    label(ev.blocks, "context", RULES)
+    assert list(ev.blocks.context) == ["odd", "none"]
+    assert list(split_by(ev.blocks, "context")) == ["odd"]           # "none" dropped
+    assert list(split_by(ev.blocks, "context", drop=())) == ["none", "odd"]
+
+
+def test_label_overlapping_rules_raise():
+    ev = parse_task_events(clean_codes(session()))
+    with pytest.raises(ValueError, match="more than one rule"):
+        label(ev.blocks, "context", {"a": lambda x: x.block > 0, "b": lambda x: x.block == 1})

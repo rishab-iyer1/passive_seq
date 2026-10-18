@@ -1,17 +1,27 @@
 """Parse Blackrock .nev digital event codes into pynapple objects.
 
 Typical use:
-    from nev_events import load_task_events
+    from nev_events import load_task_events, label, split_by
+
     ev = load_task_events("day2.nev")
     print(ev.summary())
+
     spikes.restrict(ev.baseline)
     nap.compute_perievent(spikes, ev.images, minmax=(-0.2, 0.6))
+
+    CONTEXTS = {
+        "context1": lambda x: (x.block <= 20) & (x.block % 2 == 1),
+        "context2": lambda x: (x.block <= 20) & (x.block % 2 == 0),
+    }
+    label(ev.blocks, "context", CONTEXTS)
+    nap.compute_response_per_epoch(spikes, split_by(ev.blocks, "context"))
 
 Structure:
     read_event_codes   -- file I/O only (neo); returns the raw port values
     clean_codes        -- drops clears (0) and half-written glitch values
     parse_task_events  -- pure function: cleaned codes -> TaskEvents
     load_task_events   -- convenience wrapper chaining the three
+    make_epochs / label / split_by -- turn IntervalSets into named epoch dicts
 
 Only read_event_codes touches the file, so the other two can be unit tested
 on synthetic nap.Tsd streams.
@@ -60,6 +70,10 @@ class TaskEvents:
     sequences: nap.IntervalSet
     reward: nap.IntervalSet
     images: nap.Tsd
+
+    def epochs(self, names=("baseline", "task", "blocks", "sequences", "reward")) -> dict:
+        """Phases as a plain {name: IntervalSet} dict (e.g. for compute_response_per_epoch)."""
+        return {name: getattr(self, name) for name in names}
 
     def summary(self) -> str:
         lines = []
@@ -181,3 +195,51 @@ def load_task_events(
     """Read, clean and parse a .nev file in one call."""
     codes = clean_codes(read_event_codes(path, event_channel_index), min_hold)
     return parse_task_events(codes, require_sequential_images)
+
+
+# ── Epoch helpers ───────────────────────────────────────────────────
+# A "rules" dict maps a name to a filter: a function taking an IntervalSet
+# and returning a boolean mask, e.g.
+#     CONTEXTS = {
+#         "context1": lambda x: (x.block <= 20) & (x.block % 2 == 1),
+#         "context2": lambda x: (x.block <= 20) & (x.block % 2 == 0),
+#     }
+
+
+def make_epochs(iset: nap.IntervalSet, rules: dict) -> dict:
+    """{name: IntervalSet} with the intervals matching each rule.
+
+    make_epochs(ev.blocks, CONTEXTS)  ->  {"context1": ..., "context2": ...}
+    """
+    return {name: iset[np.asarray(rule(iset))] for name, rule in rules.items()}
+
+
+def label(iset: nap.IntervalSet, column: str, rules: dict, default: str = "none") -> nap.IntervalSet:
+    """Add a metadata column naming the rule each interval matches (in place).
+
+    Intervals matching no rule get `default`; matching two rules raises.
+
+    label(ev.blocks, "context", CONTEXTS)
+    ev.blocks[ev.blocks.context == "context1"]
+    """
+    names = np.full(len(iset), default, dtype=object)
+    n_hits = np.zeros(len(iset), dtype=int)
+    for name, rule in rules.items():
+        mask = np.asarray(rule(iset))
+        names[mask] = name
+        n_hits += mask
+    if np.any(n_hits > 1):
+        raise ValueError(f"'{column}': some intervals match more than one rule")
+    iset.set_info(**{column: names})
+    return iset
+
+
+def split_by(iset: nap.IntervalSet, column: str, prefix: str = "", drop=("none",)) -> dict:
+    """{value: IntervalSet}, one entry per value of a metadata column.
+
+    split_by(ev.blocks, "context")            ->  {"context1": ..., "context2": ...}
+    split_by(ev.blocks, "block", "block")     ->  {"block1": ..., "block2": ..., ...}
+    Values in `drop` (default: the `label` default "none") are left out.
+    """
+    values = np.asarray(getattr(iset, column))
+    return {f"{prefix}{v}": iset[values == v] for v in np.unique(values) if v not in drop}
