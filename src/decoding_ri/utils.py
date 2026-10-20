@@ -18,8 +18,10 @@ Metadata: block (all but baseline/task), seq (sequences, images), image and
 pos (images; pos = 1st, 2nd, ... in its sequence), context (if given).
 """
 
+from pathlib import Path
 import numpy as np
 import pynapple as nap
+import scipy.io
 
 # Encode table (from the task code)
 START_TASK, REWARD_START, REWARD_END, END_TASK, INITIAL_START = 1, 2, 3, 4, 5
@@ -31,7 +33,31 @@ DISPLAY_DURATION = 0.283   # s on screen (17 frames at 60 Hz, measured by photod
 MAX_PHOTODIODE_LAG = 0.1   # s; photodiode must change this soon after the image code
 MIN_HOLD = 0.001           # s; real codes stay on the port ~8 ms, glitches ~0.1 ms
 
+def load_session(nev_path, mat_path, cache_dir=None, refresh=False, photodiode_ch=3):
+    """(spikes, events, behav). With cache_dir: load from it if present, else build and save."""
+    cache = Path(cache_dir) if cache_dir else None
 
+    if cache and cache.exists() and not refresh:
+        spikes = nap.load_file(cache / "spikes.npz")
+        events = {f.stem[3:]: nap.load_file(f) for f in sorted(cache.glob("ev_*.npz"))}
+        behav = np.load(cache / "behav.npy", allow_pickle=True)[()]
+        return spikes, events, behav
+
+    data = nap.EphysReader(nev_path)
+    spikes = data["TsGroup"]
+    events = load_task_events(nev_path, photodiode=data["1:nsx4"][:, photodiode_ch])
+    trial = scipy.io.loadmat(mat_path)["bhv"][0][0]["temp_trial"][0][0]
+    fields = ["blockId", "seq", "imgId", "imgTime"]
+    behav = {k: trial[k] for k in fields}
+    if cache:
+        cache.mkdir(parents=True, exist_ok=True)
+        spikes.save(cache / "spikes.npz")
+        for name, iset in events.items():
+            iset.save(cache / f"ev_{name}.npz")
+        np.save(cache / "behav.npy", behav, allow_pickle=True)
+    return spikes, events, behav
+
+    
 def load_task_events(path, photodiode=None, contexts=None, display_duration=DISPLAY_DURATION):
     """Read a .nev file and return {name: IntervalSet}.
 
@@ -163,4 +189,3 @@ def split_by(iset, column, prefix="", drop=("none",)):
     """
     values = np.asarray(getattr(iset, column))
     return {f"{prefix}{v}": iset[values == v] for v in np.unique(values) if v not in drop}
-    
