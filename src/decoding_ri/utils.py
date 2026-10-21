@@ -19,9 +19,12 @@ pos (images; pos = 1st, 2nd, ... in its sequence), context (if given).
 """
 
 from pathlib import Path
+
 import numpy as np
-import pynapple as nap
+import pandas as pd
 import scipy.io
+
+import pynapple as nap
 
 # Encode table (from the task code)
 START_TASK, REWARD_START, REWARD_END, END_TASK, INITIAL_START = 1, 2, 3, 4, 5
@@ -33,10 +36,10 @@ DISPLAY_DURATION = 0.283   # s on screen (17 frames at 60 Hz, measured by photod
 MAX_PHOTODIODE_LAG = 0.1   # s; photodiode must change this soon after the image code
 MIN_HOLD = 0.001           # s; real codes stay on the port ~8 ms, glitches ~0.1 ms
 
-def load_session(nev_path, mat_path, cache_dir=None, refresh=False, photodiode_ch=3):
+def load_session(nev_path, mat_path, array, cache_dir=None, refresh=False, photodiode_ch=3):
     """(spikes, events, behav). With cache_dir: load from it if present, else build and save."""
-    cache = Path(cache_dir) if cache_dir else None
-
+    cache = Path(cache_dir) / f"array_{array}" if cache_dir else None
+    
     if cache and cache.exists() and not refresh:
         spikes = nap.load_file(cache / "spikes.npz")
         events = {f.stem[3:]: nap.load_file(f) for f in sorted(cache.glob("ev_*.npz"))}
@@ -57,6 +60,32 @@ def load_session(nev_path, mat_path, cache_dir=None, refresh=False, photodiode_c
         np.save(cache / "behav.npy", behav, allow_pickle=True)
     return spikes, events, behav
 
+
+def combine_arrays(spikes_a, events_a, spikes_p, events_p, names=("a001", "p001")):
+    """One TsGroup with both arrays on array A's clock. Use it with events_a.
+
+    P's spike times are mapped with a quadratic fit to the image codes both
+    files share; raises if the two event streams don't match.
+    """
+    ia, ip = events_a["images"], events_p["images"]
+    for col in ("image", "block", "seq", "pos"):
+        assert np.array_equal(np.asarray(ia[col]), np.asarray(ip[col])), f"images differ in '{col}'"
+
+    xa, xp = np.asarray(ia.code_onset), np.asarray(ip.code_onset)
+    coef = np.polyfit(xp, xa, 2)
+    err = np.abs(np.polyval(coef, xp) - xa).max()
+    assert err < 1e-3, f"clock mapping error {err * 1e3:.2f} ms; check for pauses or mismatched events"
+
+    p_on_a = {i: nap.Ts(t=np.polyval(coef, spikes_p[i].t)) for i in spikes_p.index}
+    n_a = len(spikes_a)
+    meta = pd.concat([spikes_a.metadata.assign(array=names[0]),
+                      spikes_p.metadata.assign(array=names[1])], ignore_index=True)
+    return nap.TsGroup(
+        {**{k: spikes_a[i] for k, i in enumerate(spikes_a.index)},
+         **{n_a + k: p_on_a[i] for k, i in enumerate(spikes_p.index)}},
+        metadata=meta.drop(columns="rate"),
+    )
+    
     
 def load_task_events(path, photodiode=None, contexts=None, display_duration=DISPLAY_DURATION):
     """Read a .nev file and return {name: IntervalSet}.
