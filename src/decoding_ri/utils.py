@@ -218,3 +218,61 @@ def split_by(iset, column, prefix="", drop=("none",)):
     """
     values = np.asarray(getattr(iset, column))
     return {f"{prefix}{v}": iset[values == v] for v in np.unique(values) if v not in drop}
+
+
+def match_features(a, b, *, k=5, tol=0.25, max_mismatch=0.05, min_ratio=10,
+                   min_r=0.9, require_sorted=True):
+    """
+    Return, for each feature (axis 0) of `a`, the index of the feature in `b`
+    it was derived from. Raises ValueError if any match is not convincing.
+    
+    Used because the .mat features used for making the plot in the original grant submission were a subset 
+    of the total data, so want to check which of the electrodes were chosen out of the 255 total.
+ 
+    For each feature of `a`, the top-k correlated features of `b` are
+    candidates. Each is fit as a ≈ s*b + c, and an element counts as a
+    mismatch if its residual exceeds `tol` standard deviations of a's feature.
+    The candidate with the fewest mismatches wins, and must have:
+      - mismatch rate <= max_mismatch
+      - at least min_ratio times fewer mismatches than the next candidate
+      - correlation >= min_r (sanity floor)
+    Matches must also be one-to-one and, optionally, strictly increasing.
+    """
+    if np.shape(a)[1:] != np.shape(b)[1:]:
+        raise ValueError(f"Trailing shapes differ: {np.shape(a)[1:]} vs {np.shape(b)[1:]}")
+    A = np.asarray(a, float).reshape(len(a), -1)
+    B = np.asarray(b, float).reshape(len(b), -1)
+    if (A.std(1) == 0).any() or (B.std(1) == 0).any():
+        raise ValueError("Inputs contain constant features")
+ 
+    zscore = lambda X: (X - X.mean(1, keepdims=True)) / X.std(1, keepdims=True)
+    corr = zscore(A) @ zscore(B).T / A.shape[1]
+ 
+    def mismatch_rate(x, y):
+        s, c = np.polyfit(y, x, 1)
+        return np.mean(np.abs(x - (s * y + c)) > tol * x.std())
+ 
+    best, errors = [], []
+    for i, x in enumerate(A):
+        cands = np.argsort(corr[i])[::-1][:max(k, 2)]
+        miss = np.array([mismatch_rate(x, B[j]) for j in cands])
+        o = np.argsort(miss, kind="stable")
+        j, m1, j2, m2 = cands[o[0]], miss[o[0]], cands[o[1]], miss[o[1]]
+        best.append(int(j))
+ 
+        if corr[i, j] < min_r:
+            errors.append(f"a[{i}]: r={corr[i, j]:.4f} < {min_r}")
+        if m1 > max_mismatch:
+            errors.append(f"a[{i}]: mismatch rate {m1:.4f} > {max_mismatch}")
+        if m2 == 0 or m2 < min_ratio * m1:
+            errors.append(f"a[{i}]: ambiguous, b[{j}] ({m1:.4f}) vs b[{j2}] ({m2:.4f})")
+ 
+    dupes = [j for j in set(best) if best.count(j) > 1]
+    if dupes:
+        errors.append(f"b-features matched more than once: {sorted(dupes)}")
+    if require_sorted and np.any(np.diff(best) <= 0):
+        errors.append("matched indices are not strictly increasing")
+ 
+    if errors:
+        raise ValueError("Feature matching failed:\n  " + "\n  ".join(errors))
+    return best
